@@ -22,6 +22,7 @@
 #include "host.h"
 #include "sm2msl.h"
 #include "input.h"
+#include "bc_decode.h"
 
 // ---- guest object layout (mirrors d3d9.c) ---------------------------------------------------------
 #define OBJ_KIND(o) G32((o) + 8)
@@ -116,6 +117,10 @@ static void blk_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); 
 #define LOCKED_END pthread_mutex_unlock(&blk);
 
 // ---- formats ----------------------------------------------------------------------------------------
+// Apple-GPU iPhones/iPads cannot create BC textures (Metal aborts on the descriptor), so without
+// supportsBCTextureCompression the DXT/ATI formats are decoded on the CPU into BGRA8/R8/RG8 at upload
+// time (bc_decode.h). FNV_SOFT_BC=1 forces that path on hardware that does support BC, for testing.
+static int bc_native;
 typedef struct { MTLPixelFormat pf; MTLTextureSwizzleChannels sw; int has_sw; } Fmt;
 static Fmt fmt_map(uint32_t f) {
     Fmt r = {MTLPixelFormatInvalid, MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha), 0};
@@ -146,7 +151,14 @@ static Fmt fmt_map(uint32_t f) {
     case 80: case 70: r.pf = MTLPixelFormatDepth16Unorm; break;
     case 75: case 77: case 71: r.pf = MTLPixelFormatDepth32Float_Stencil8; break;
     default:
-        if (f == FCC('D', 'X', 'T', '1')) r.pf = MTLPixelFormatBC1_RGBA;
+        if (!bc_native && bc_kind(f) != BC_NONE) {
+            switch (bc_kind(f)) {
+            case BC_ATI1: r.pf = MTLPixelFormatR8Unorm; SW(Red, Red, Red, One); break;
+            case BC_ATI2: r.pf = MTLPixelFormatRG8Unorm; SW(Green, Red, One, One); break;     // same channel order as BC5 below
+            default: r.pf = MTLPixelFormatBGRA8Unorm; break;
+            }
+        }
+        else if (f == FCC('D', 'X', 'T', '1')) r.pf = MTLPixelFormatBC1_RGBA;
         else if (f == FCC('D', 'X', 'T', '2') || f == FCC('D', 'X', 'T', '3')) r.pf = MTLPixelFormatBC2_RGBA;
         else if (f == FCC('D', 'X', 'T', '4') || f == FCC('D', 'X', 'T', '5')) r.pf = MTLPixelFormatBC3_RGBA;
         else if (f == FCC('A', 'T', 'I', '1')) { r.pf = MTLPixelFormatBC4_RUnorm; SW(Red, Red, Red, One); }
@@ -190,8 +202,18 @@ static void upload_level(HTex *t, uint32_t surf, uint32_t face, uint32_t level) 
     uint32_t w = G32(OBJ_F(surf, S_W)), h = G32(OBJ_F(surf, S_H)), pitch = G32(OBJ_F(surf, S_PITCH));
     int blk = d3d_fmt_block(t.fmt);
     uint32_t rows = blk ? (h + 3) / 4 : h;
+    BCKind soft = bc_native ? BC_NONE : bc_kind(t.fmt);
     const uint8_t *bytes = d3d_surf_begin(surf);
-    if (bytes) [t.tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face withBytes:bytes
+    if (bytes && soft != BC_NONE) {
+        uint32_t opitch = w * bc_out_bpp(soft);
+        uint8_t *out = malloc((size_t)opitch * h);
+        if (out) {
+            bc_decode_level(soft, bytes, pitch, w, h, out, opitch);
+            [t.tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face withBytes:out
+                     bytesPerRow:opitch bytesPerImage:(NSUInteger)opitch * h];
+            free(out);
+        }
+    } else if (bytes) [t.tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face withBytes:bytes
                        bytesPerRow:pitch bytesPerImage:pitch * rows];
     d3d_surf_end();
 }
@@ -985,6 +1007,8 @@ static void rec_frame(id<MTLTexture> src) {
 void d3d_backend_init(D3DState *s) {
     trace_metal = getenv("FNV_TRACE_METAL") != NULL;
     dev = MTLCreateSystemDefaultDevice();
+    bc_native = [dev respondsToSelector:@selector(supportsBCTextureCompression)] && dev.supportsBCTextureCompression && !getenv("FNV_SOFT_BC");
+    fprintf(stderr, "[metal] BC textures: %s\n", bc_native ? "native" : "software-decoded (device has no BC support)");
     queue = [dev newCommandQueue];
     copts = [MTLCompileOptions new];
     copts.mathMode = MTLMathModeSafe;
